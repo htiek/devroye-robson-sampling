@@ -1,0 +1,298 @@
+# File: DevroyeRobson.py
+# Author: Keith Schwarz (htiek@cs.stanford.edu)
+#
+# A modified implementation of Algorithm 6 from Devroye and Robson's
+# paper "On the Generation of Random Binary Search Trees," SIAM 1995.
+# This algorithm takes as input a number n and outputs the height
+# of a randomly-built binary search tree whose size is at least
+# n and roughly on the order of n, where the tree is built by
+# inserting a uniformly-random permutation of n nodes. However, the
+# algorithm doesn't actually simulate placing those nodes into a
+# tree. It uses a much more clever strategy to achieve a runtime
+# of O(log^4 n), compared with the O(n log n) naive strategy.
+#
+# The algorithm is based on the following series of observations.
+# First, whenever we insert a node into a binary search tree, that
+# new node is placed where a null pointer used to be (either at
+# the root or in a place given by a missing child). Moreover, the
+# specific null that's replaced is uniformly-random throughout the
+# tree; that's because the position of the newly-inserted element
+# is equally probable over all possible positions at or between
+# elements.
+#
+# Next, look at what happens when an element is inserted where a
+# null used to be. The element takes the position of that null,
+# and then ends up with two null children. We can in a sense think
+# of what's going on here as a new element being created, the
+# existing null moving to become one of the new node's children,
+# and a new null being created to fill in the other null. In this
+# sense, instead of thinking of inserting a new _node_ into the
+# tree, we can envision inserting a new _null_ into the tree,
+# with the actual tree node just being glue to hold everything
+# together.
+#
+# Now, imagine that we have an existing tree and we add a large
+# number of new nodes in rapid succession. As we saw above, that
+# ends up being equivalent to inserting a large number of new
+# nulls in rapid succession. Now, focus on any one null that was
+# already in the tree. Some number of those nulls will end up
+# landing in the subtree rooted at that null. And an interesting
+# thing happens: the more nulls land in that subtree, the more
+# nulls are more likely to land in that subtree later. Why?
+# Because the probability of any null being the target of a new
+# insertion is equal across the tree, and if there are more nulls
+# within that subtree, there are more spaces for future nulls to
+# land.
+#
+# The major insight that Devroye and Robson use in their algorithm
+# is that instead of imagining firing a fixed number of new nulls
+# into the tree, we can imagine a Poisson-like process in which
+# each null is independently likely to receive a null within some
+# time period. But as more and more nulls land on top of that
+# null, the rate at which further nulls accrue in that time period
+# accelerates.
+#
+# The specific way in which this plays out turns out to be a well-
+# studied stochastic process called a pure-birth process or a
+# Yule-Furry process. Specifically, imagine we have a collection
+# of n nulls. We imagine there's some "growth rate" g such that
+# in any infinitesimally-small time window of length dt, the
+# probability that one of those nulls receives another null is
+# given by n * g * dt. Using a bit of calculus, we can show that,
+# if we begin with a single null, the probability that there are
+# exactly n nulls after t time is given by a geometric distribution
+# with parameter exp(tg). If we let Delta = exp(tg) be a new
+# parameter describing the exponential growth rate of the process,
+# then the probability that after Delta units of time have elapsed
+# that we have a population of n is given by
+#
+#        Delta^{-1} * (1 - Delta^{-1})**(n-1).
+#
+# This is the PDF of a Geometric(Delta^{-1}) variable, and so we
+# know on expectation that each null is replaced by Delta^{-1} new nulls.
+#
+# This means that we can imagine the growth of the tree as a process
+# by which each null grows independently of the others for a duration
+# that results in the expected number of nulls in the resulting tree
+# being exp(Delta) and the exact number being geometrically
+# distributed.
+#
+# The algorithm makes use of this fact to repeatedly grow the tree
+# by a factor of (roughly) 2 by choosing Delta = 2 and simulating
+# the effect of each node growing independently.
+#
+# To do this, the algorithm maintains an array of the number of nulls
+# at each level of the tree. It then sweeps down from the top of the
+# tree to the bottom. At each level of the tree, we have the
+# probability distribution of how many nulls are likely to land on
+# each of the nulls in the level. We thus can imagine sampling from
+# a multinomial distribution given that probability distribution to
+# determine the distribution of the number of nulls that reach each
+# node. From there, we can move to the next level of tree, continuing
+# to expand nulls out while also deciding how to partition the nulls
+# generated by the previous level into subtrees.
+#
+# The "true" version of the algorithm works in two phases and produces
+# a tree with exactly n nodes. It works by first exponentially growing
+# the tree by a factor of (roughly) 2 until we get within a constant
+# factor of n, then switching the exponential growth rate to something
+# smaller so that we converge closer to n. If an iteration would
+# overshoot n, we discard it and try again. This works great for smaller
+# n, but fails when n is so large that the probabilities underflow a
+# floating-point value. This code was intended to get a sense of the
+# distributions of heights of randomly-built BSTs over a large range
+# where it was less important to have exactly n nodes, and so I've let
+# this code instead produce trees of at least n nodes rather than
+# exactly n nodes.
+import numpy as np
+from math import *
+
+# Global binomial sampler
+rng = np.random.default_rng()
+
+# When growing the tree, we need to sample from a multinomial
+# distribution whose underlying probability is a geometric
+# random variable with parameter 1/2. This is essentially
+# equivalent to drawing a Binomial(n, 1/2) random variable
+# to get the number of items in the first class, then
+# another Binomial(n - #items in first class, 1/2) variable
+# for items in the second class, etc.
+def multinomial_geometric_sample(population):
+    # We always have probability 0 of seeing 0 items.
+    result = [0]
+    
+    # Repeat draws until everything is accounted for.
+    while population > 0:
+        result.append(rng.binomial(population, 1/2))
+        population -= result[-1]
+    
+    return result
+
+# When distributing nulls across subtrees, we will find that
+# a null with m child nulls will have equal chance of forming
+# left subtrees with 1, 2, 3, ..., m-1 nulls in them. We need
+# to do this for a large number of trees, which means we need
+# to sample from a uniform multinomial distribution with,
+# say, m options. Thus we draw a Binomial(population, 1/m)
+# variable to count the number of trees of size 1, a
+# Binomial(population - #trees of size1, 1/(m-1)) variable
+# to count the number of trees of size 2, etc.
+def multinomial_uniform_sample(population, num_outcomes):
+    # We always have probability 0 of seeing 0 items.
+    result = [0] * (num_outcomes + 1)
+    
+    # Repeat draws until everything is accounted for.
+    i = 1
+    while population > 0:
+        result[i] = rng.binomial(population, 1 / (num_outcomes + 1 - i))
+        population -= result[i]
+        i += 1
+    
+    return result
+
+# Runs one iteration of the tree growth step (simulating each null
+# growing) to roughly double the tree size
+def expand_tree(nulls_per_level):
+    # Carryover tree sizes from the previous row of the tree. Index i represents
+    # the number of trees with i nulls in them that were produced as children of
+    # the previous row.
+    carryover_sizes = []    
+
+    # Index of the highest index within carryover_sizes that is
+    # nonzero, or 0 if they're all zero. This is an optimization that
+    # ensures that we don't spend time copying over lots of zero values.
+    # Removing it doesn't change correctness but does slow things down
+    # quite a bit.
+    last_carryover_index = 0        
+    
+    # Which level of the tree we are currently exploring.
+    curr_level = 0
+    
+    # Walk down from the top of the tree toward the bottom. At each level, we'll
+    # simulate the effect of the nulls at that level growing into larger trees.
+    # As we do, we may add new nulls to lower levels, and may even grow the tree
+    # by adding additional layers. This loop runs until every null that we've
+    # generated has been accounted for.
+    while True:
+        # We may be at an existing level of the tree, or at a level of the tree
+        # that hasn't been reached yet. In the latter case, grow the tree by
+        # one level.
+        if curr_level == len(nulls_per_level):
+            nulls_per_level.append(0)
+        
+        # Every null within this level of the tree will grow by having some
+        # new number of nulls arrive at it. We know the distribution of the
+        # number of nulls that may arrive (multi_probs). To efficiently
+        # simulate having each one determine its tree size, we sample from
+        # a multinomial distribution with those underlying probabilities
+        # and with a number of trials equal to the number of nulls in this
+        # level of the tree. The result is a frequency histogram saying,
+        # for each number of nulls, how many nulls within this level had
+        # that many nulls in its resulting tree.
+        #
+        # Note that the 0th entry here will always be 0, because no null
+        # will ever be replaced by no nulls. Worst-case it's replaced
+        # with itself.
+        null_size_counts = multinomial_geometric_sample(nulls_per_level[curr_level])
+    
+        # Find the maximum number of nulls produced by any of the nulls at this
+        # level of the tree
+        max_nulls = max(len(null_size_counts) - 1, last_carryover_index)
+
+        # In the previous layer of the tree, we generated some number of subtrees
+        # that are rooted at this level of the tree. We know how many trees of
+        # each size there are. Import the carried-over trees to this level.
+        #
+        # last_carryover_index is an inclusive bound.
+        for i in range(1, last_carryover_index + 1):
+            if i == len(null_size_counts): null_size_counts.append(0)
+            null_size_counts[i] += carryover_sizes[i]
+
+        # We've just carried everything over from the previous level
+        # of the tree. Zero out the carryover array. It has slots
+        # for sizes 1, 2, ..., max_nulls - 1, because each carried-
+        # over tree necessarily uses up one null.
+        carryover_sizes = [0] * max_nulls
+    
+        # Now that we've expanded all the nulls at this level, we know how many
+        # nulls now should be at this level of the tree: it's the number of
+        # subtrees rooted here that have exactrly one null in them.
+        if len(null_size_counts) == 1: null_size_counts.append(0)
+        nulls_per_level[curr_level] = null_size_counts[1]
+    
+        # Each subtree rooted at this level that has more than one null corresponds
+        # to a tree with a single root node and two smaller trees. Each of those
+        # two smaller trees is rooted at the next level of the tree and has somewhere
+        # between 1 and m - 1 nulls in it. Why? If the tree is empty, it has one
+        # null. That gives a lower bound of 1 null. The upper bound is then m - 1,
+        # because if we have m total nulls to distribute at each subtree gets at
+        # least 1, each subtree also gets at most m - 1.
+        #
+        # Given any one tree at this level with m nulls in it, we'd thus choose
+        # a uniformly-random number of nulls k between 1 and m - 1 to put into
+        # its left subtree. We then put m - k nulls into the right subtree.
+        #
+        # We, however, potentially have _lots_ of trees of that size. We can
+        # simulate sampling lots of different tree sizes by treating it as sampling
+        # from a uniform multinomial distribution with probability 1/(m-1) for each
+        # of the m-1 outputs from 1 to m-1.            
+        for m in range(2, max_nulls + 1):
+            # The multinomial distribution mentioned above.
+            left_subtree_sizes = multinomial_uniform_sample(null_size_counts[m], m - 1)   
+        
+            # Now that we have the subtree sizes, we can determine what the
+            # tree size carryovers will be into the next layer. For each tree
+            # that produced a subtree of size k, we put one tree of size k into
+            # the next level and one tree of size m - k into the other.
+            #
+            # The sizes of the subtrees ranges from 1 to m - 1, inclusive.
+            for k in range(1, m):
+                carryover_sizes[k]      += left_subtree_sizes[k]
+                carryover_sizes[m - k]  += left_subtree_sizes[k]
+        
+        # Now, determine the maximum index used in the carryover array. We know it
+        # can't be more than max_nulls, so start scanning backwards from there.
+        last_carryover_index = len(carryover_sizes) - 1
+        while last_carryover_index > 0 and carryover_sizes[last_carryover_index] == 0:
+            last_carryover_index -= 1
+        
+        # Done with this level of the tree; onto the next one!
+        curr_level += 1
+        
+        # If we are off the bottom of the tree and have nothing further to propagate,
+        # we have finished this top-down pass.
+        if curr_level == len(nulls_per_level) and last_carryover_index == 0: break
+
+def simulate_tree(n):
+    # Just in case we have a floating-point value, round down.
+    n = floor(n)
+
+    # Array tracking the number of nulls at each level of the tree.
+    # Initially, the tree is just a single null at the root.
+    nulls_per_level = [1]
+    
+    # Total number of nulls in the tree.
+    total_nulls = 1
+
+    # A tree with n nodes will have n + 1 nulls in it. Loop until
+    # we overshoot.
+    while sum(nulls_per_level) < n + 1:  
+        expand_tree(nulls_per_level)
+    
+    # The total number of nulls in the tree is now n + 1.
+    #
+    # The height of the tree is given by the number of levels minus one. 
+    # However, the very last level of the tree consists entirely of nulls
+    # and thus isn't actually part of the tree. Thus we subtract an extra
+    # one to remove that layer.
+    return sum(nulls_per_level) - 1, len(nulls_per_level) - 2
+
+# Sample code that generates a CSV file containing many simulated
+# tree sizes and heights.
+print("Number of Nodes,Tree Height")
+
+target_nodes = 1
+while target_nodes <= 1e20:
+    n, height = simulate_tree(target_nodes)    
+    print(f"{n},{height}")
+    target_nodes *= 1.1
